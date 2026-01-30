@@ -1,0 +1,358 @@
+
+John Hauser's RISC-V APLIC implementation
+
+John R. Hauser
+2026 January 29
+
+
+Warning!  This implementation is still in development and has only been
+partially tested so far.  There may be bugs, possibly serious ones.
+
+-------------------------------------------------------------------------------
+License
+
+The following applies to the whole of this RISC-V APLIC, as well as to each
+source file individually.
+
+Copyright 2022-2025 John R. Hauser.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+-------------------------------------------------------------------------------
+Basic overview
+
+This APLIC implementation is written in parameterized SystemVerilog.
+The source code should be acceptable to Verilator and to Xilinx's Vivado.
+Compatibility with other software that purports to accept SystemVerilog is
+unknown to me.
+
+To use Verilator, option '-Wno-WIDTH' is necessary.
+
+Currently, this APLIC implementation has interfaces that connect to
+AXI4-Lite buses.  The bulk of the APLIC is implemented as a module called
+'APLIC_mainM', which has a simple bespoke interface.  For AXI4-Lite buses,
+this main module is wrapped by another module of type 'APLIC_AXI4LiteM'.
+A client only needs to instantiate 'APLIC_AXI4LiteM', and this contains the
+complete APLIC.
+
+Wrapper modules for other buses are also possible, but don't exist yet.
+
+In the names of data types, module definitions, parameters, and ports, "T"
+often means _type_, "M" often means _module_, "W" often means _width_, and
+"V" often indicates a bit vector.
+
+-------------------------------------------------------------------------------
+Configuration parameters
+
+The 'options' parameter is currently ignored and should be left as its
+default of zero.
+
+Most parameters that define a specific APLIC are passed in a structure
+of type 'APLICPkg::configT', defined in "APLICPkg.sv".  An example of a
+possible instance of 'APLICPkg::configT' is the following:
+
+    localparam APLICPkg::configT APLICConfig = '{
+        sources: '{
+            num: shortint'(100),
+            implDetachedV:
+                                                 5'b_11111<<96
+                | 32'b_11111111_11111000_00000000_00000000<<64
+                | 32'b_00000000_00000000_00000000_00000000<<32
+                | 32'b_00000000_00000000_00000000_00000000,
+            implEdge1V:
+                                                 5'b_00000<<96
+                | 32'b_00000111_11111111_11111111_11111111<<64
+                | 32'b_11111111_11111111_11111111_11111111<<32
+                | 32'b_11111111_11111111_11100000_11111110,
+            implEdge0V:  '0,
+            implLevel1V: '1,  // (all 1s)
+            implLevel0V: '0
+        },
+        harts: '{
+            maxHartIndex: shortint'(8),
+            numValidHartIndexRanges: byte'(1),
+            validHartIndexRanges: {{shortint'(0), shortint'(8)}},
+            implLittleEndian: '1,
+            implBigEndian:    '0,
+            maxGEILEN: byte'(6)
+        },
+        deliverDirectHartIndexRange: '0,
+        implOutTopMIntrPrios: '0,
+        implOutTopSIntrPrios: '0,
+        outTopIntrPriosHartIndexRange: '0,
+        mmsiaddrcfg_writable:
+            '{ L: '1, HHXS: 'b11111, LHXS: 'b111, HHXW: 'b011, LHXW: 'b1111,
+                   basePPN: 44'h00000FFFFF0 },
+        mmsiaddrcfg_const: '0,
+        smsiaddrcfg_writable: '{ LHXS: 'b111, basePPN: 44'h00000FFFFF0 },
+        smsiaddrcfg_const: '0,
+        numDomains: byte'(3),
+        domains: {
+            APLICPkg::domainConfigT'{ // 2
+                parentNum: byte'(1),
+                privLevel: APLICPkg::privLevel_S,
+                firstHartIndex: shortint'(1),
+                numHartIndices: shortint'(8),
+                S_perceivedFirstHartIndex: shortint'(0),
+                implDeliverDirect: '0,
+                implDeliverMSI:    '1,
+                M_msiaddrcfg_visible: '0
+            },
+            APLICPkg::domainConfigT'{ // 1
+                parentNum: byte'(0),
+                privLevel: APLICPkg::privLevel_M,
+                firstHartIndex: shortint'(1),
+                numHartIndices: shortint'(8),
+                S_perceivedFirstHartIndex: '0,
+                implDeliverDirect: '0,
+                implDeliverMSI:    '1,
+                M_msiaddrcfg_visible: '1
+            },
+            APLICPkg::domainConfigT'{ // 0 (root domain)
+                parentNum: byte'(-1),
+                privLevel: APLICPkg::privLevel_M,
+                firstHartIndex: shortint'(0),
+                numHartIndices: shortint'(1),
+                S_perceivedFirstHartIndex: '0,
+                implDeliverDirect: '0,
+                implDeliverMSI:    '1,
+                M_msiaddrcfg_visible: '1
+            }
+        },
+        intrPrioW: byte'(0),
+        EIIDW: byte'(8)
+    };
+
+Some notes concerning the 'APLICPkg::configT' structure:
+
+Abbreviation "impl" is short for _implement_.
+
+Because interrupt source number 0 is never valid, the value of bit 0 is
+ignored in 'sources.implDetachedV' and the others.  The values of higher
+bits that don't correspond with actual interrupt sources are likewise
+ignored.
+
+If an interrupt source is configured to implement Detached mode along with
+three of the other active modes (Edge1, Edge0, Level1, and Level0), then
+actually all source modes are implemented, because that is less trouble than
+implementing the requested smaller set.  In all other cases, the only source
+modes implemented are the ones explicitly configured.
+
+Valid hart index numbers are all within the range 0 to 'maxHartIndex',
+inclusive.  But not all numbers in this range need to refer to real harts.
+
+If no interrupt domain implements direct delivery mode, field
+'deliverDirectHartIndexRange' should be set to all zeros.
+
+The output of top interrupt priorities is not yet supported.  Set the
+configuration fields 'implOutTopMIntrPrios', 'implOutTopSIntrPrios' and
+'outTopIntrPriosHartIndexRange' all to zeros as shown above.
+
+For MSI delivery mode, configuration fields 'mmsiaddrcfg_writable' and
+'smsiaddrcfg_writable' indicate which bits are writable in each subfield of
+registers 'mmsiaddrcfg', 'mmsiaddrcfgh', 'smsiaddrcfg', and 'smsiaddrcfgh'.
+For the bits of these register subfields that are read-only (not writable),
+configuration fields 'mmsiaddrcfg_const' and 'smsiaddrcfg_const' indicate
+what the read-only values of these bits are.
+
+Every interrupt domain has a number, and the number of each domain's parent
+('parentNum') must be less than its own number.  The root domain is always
+number 0, and its 'parentNum' is the special value -1.  The domain hierarchy
+must follow the other rules required of APLICs.
+
+Fields 'firstHartIndex' and 'numHartIndices' for a domain indicate a range
+of index numbers for the harts that are members of the domain.  Gaps in this
+range are not allowed (but some numbers may be nonexistent harts).
+
+Though each machine-level domain may deliver interrupts to a different set
+of harts, they all share a single mapping of hart index numbers to harts.
+For supervisor-level domains, on the other hand, the hart indices that are
+visible in the domain may be offset by a constant addend from the "real"
+index numbers for harts.  This offset equals 'S_perceivedFirstHartIndex'
+minus 'firstHartIndex'.  For machine-level domains, field
+'S_perceivedFirstHartIndex' is simply ignored.
+
+For supervisor-level domains, field 'M_msiaddrcfg_visible' is simply
+ignored.
+
+Fields 'harts.maxGEILEN' and 'EIIDW' matter only if at least one interrupt
+domain implements MSI delivery mode.  And field 'intrPrioW' matters only if
+at least one interrupt domain implements direct delivery mode.
+
+For module 'APLIC_AXI4LiteM', parameter 'managMemPortAddrW' specifies the
+width in bits of addresses at the "manager" port, used for writing outgoing
+MSIs.  If no interrupt domains implement MSI delivery mode, this parameter
+is ignored.
+
+-------------------------------------------------------------------------------
+Clock domain crossings
+
+It is the client's responsibility to handle all clock domain crossings,
+including for the interrupt inputs ('intrsInV').
+
+Warning!  The APLIC's interrupt inputs must be synchronous with the APLIC's
+clock, the same as for all other I/O ports of the module.
+
+-------------------------------------------------------------------------------
+Quirks for bus connections
+
+For the APLIC's subordinate bus port, besides the usual address input, there
+is an extra "domainNum" input that indicates the interrupt domain being
+accessed.  A client is expected typically to supply this by extracting the
+appropriate bits from a larger address.  (This is done to avoid the need
+for a multiplicity of bus-subordinate ports, one per interrupt domain.)
+The domain numbers used here are exactly the same as in the configuration
+parameters.
+
+For each interrupt domain, this APLIC module implements a memory-mapped
+control region of exactly 32 KiB, naturally aligned to a 32-KiB address
+boundary.  This size provides room in the control region's second 16 KiB for
+IDC structures supporting direct delivery of interrupts to up to 512 harts.
+(Each IDC structure is 32 bytes, and 16 KiB / 32 B = 512.)  But when a
+domain is configured to implement only MSI delivery, IDC structures are
+not used.  A client can reduce a domain's memory-mapped control region to
+16 KiB, dropping the space for IDC structures, by connecting only bits 13:0
+of the bus address and tying address bit 14 to zero.
+
+The APLIC's master bus port (called the "manager" port for AXI4-Lite) is
+used only for writing outgoing MSIs.  If no interrupt domains implement MSI
+delivery mode, this port can be left unconnected.
+
+Some bus components that are unused by the APLIC are not included in the
+ports list when they can easily be stubbed by the client.  For the AXI4-Lite
+subordinate port:
+
+  - AWPROT and ARPROT aren't needed.
+
+  - RRESP is always 0 (OKAY).
+
+For the AXI4-Lite manager bus port (used only for writing outgoing MSIs):
+
+  - The read address and read data channels aren't needed.  ARVALID can be
+    assigned permanently to zero, and RREADY permanently to one.
+
+  - If needed, AWPROT should be set by the client, however is appropriate.
+
+-------------------------------------------------------------------------------
+Other ports
+
+Input 'nReset' is an active-negative reset, and is treated as asynchronous
+within the APLIC module.  It can safely be connected either to a synchronous
+reset that is glitch-free, or to an asynchronous reset that is properly
+synchronized with the clock when releasing reset.  (A synchronous reset
+will be glitch-free if driven directly from a flip-flop, for example.)
+
+Input 'nLockReset' is another reset of the same kind, solely for the L bit
+(Lock) in the root domain's 'mmsiaddrcfgh' register.  If this register does
+not exist or if the L bit is never writable, 'nLockReset' is ignored.
+
+Input 'intrsInV' connects the input interrupt sources.  Bit 0 of 'intrsInV'
+is not associated with any interrupt source and is simply ignored.
+
+Outputs 'harts_intrs', 'harts_topMIntrPrio', and 'harts_topSIntrPrio' are
+used only for direct delivery of interrupts to harts, when not forwarding
+interrupts as MSIs.  Currently, only 'harts_intrs' is usefully implemented.
+The other two, 'harts_topMIntrPrio' and 'harts_topSIntrPrio', are always
+zeros.
+
+Each two-bit element of 'harts_intrs' supplies the external interrupts for
+a single hart.  Of these two bits for a hart, bit 0 is the machine-level
+interrupt, and bit 1 is the supervisor-level interrupt (if relevant).
+
+-------------------------------------------------------------------------------
+Status of testing
+
+Some APLIC features are reasonably well tested while others have so far been
+subjected to only light testing at best.
+
+REGARDLESS OF ANY AND ALL TESTING PERFORMED BY THE AUTHORS OR COLLABORATORS,
+BE AWARE THAT THIS APLIC MAY CONTAIN FLAWS THAT CAUSE IT TO FAIL.  USE AT
+YOUR OWN RISK.
+
+The most extensive testing to date has been done by the good folks
+at Ventana Micro Systems (now part of Qualcomm), for specific APLIC
+configurations involving MSI delivery mode only.  The following people
+especially deserve to be acknowledged for their contributions to this
+testing work:
+
+    Fatima Khurshid
+    Haroon Shafique
+    Josh Scheid
+    Paul Donahue
+    Vaibhav Dhotre
+    Danish Hussain
+    Rohan Arshad
+    Ali Faraz
+
+The configurations tested by Ventana Micro Systems are reported to be of
+this form:
+
+      sources: '{
+          num: shortint'(NUM_SOURCES),
+          // All modes are supported for all sources.
+          implDetachedV: '1,
+          implEdge1V:    '1,
+          implEdge0V:    '1,
+          implLevel1V:   '1,
+          implLevel0V:   '1
+      },
+      harts: '{
+          maxHartIndex: shortint'(NUM_HARTS - 1),
+          numValidHartIndexRanges: byte'(1),
+          validHartIndexRanges: {{shortint'(0), shortint'(NUM_HARTS - 1)}},
+          implLittleEndian: '1,
+          implBigEndian:    '1,
+          maxGEILEN: byte'(10)
+      },
+      // No direct delivery is supported.
+      deliverDirectHartIndexRange: '0,
+      implOutTopMIntrPrios: '0,
+      implOutTopSIntrPrios: '0,
+      outTopIntrPriosHartIndexRange: '0,
+      // All 'msiaddrcfg' fields are fully writeable.
+      mmsiaddrcfg_writable:
+          '{ L: '1, HHXS: '1, LHXS: '1, HHXW: '1, LHXW: '1, basePPN: '1 },
+      mmsiaddrcfg_const: '0,
+      smsiaddrcfg_writable: '{ LHXS: '1, basePPN: '1 },
+      smsiaddrcfg_const: '0,
+      numDomains: byte'(2),
+      domains: {
+          // 1: S
+          APLICPkg::domainConfigT'{
+              parentNum: byte'(0),
+              privLevel: APLICPkg::privLevel_S,
+              firstHartIndex: shortint'(0),
+              numHartIndices: shortint'(NUM_HARTS),
+              S_perceivedFirstHartIndex: shortint'(0),
+              implDeliverDirect: '0,
+              implDeliverMSI:    '1,
+              M_msiaddrcfg_visible: '0
+          },
+          // 0: M
+          APLICPkg::domainConfigT'{
+              parentNum: byte'(-1),
+              privLevel: APLICPkg::privLevel_M,
+              firstHartIndex: shortint'(0),
+              numHartIndices: shortint'(NUM_HARTS),
+              S_perceivedFirstHartIndex: '0,
+              implDeliverDirect: '0,
+              implDeliverMSI:    '1,
+              M_msiaddrcfg_visible: '1
+          }
+      },
+      // No direct delivery is supported.
+      intrPrioW: '0,
+      EIIDW: byte'(EIID_WIDTH)
+
+You should assume that only limited testing has been done for any other
+configurations.
