@@ -1,0 +1,33 @@
+CAPI=2:
+
+name: johnhauser:riscv:jh_aplic:0.6.1
+description: RISC-V Advanced Platform-Level Interrupt Controller (APLIC) by John R. Hauser. Implements the RISC-V AIA specification with AXI4-Lite bus interface, supporting up to 1023 interrupt sources, up to 127 interrupt domains, direct delivery mode, and MSI delivery mode.
+license: Apache-2.0
+
+filesets:
+  rtl:
+    files:
+      - source/APLIC_limitsPkg.sv
+      - source/APLICPkg.sv
+      - source/APLIC_primitives.sv
+      - source/APLIC_iDomains.sv
+      - source/APLIC_iSources.sv
+      - source/APLIC_topIntrIdent.sv
+      - source/APLIC_topIntrPrio.sv
+      - source/APLIC_deliverIntrs.sv
+      - source/APLIC_main.sv
+      - source/APLIC_AXI4Lite.sv
+      - source/APLIC_AXI4Lite_wrapper.sv
+    file_type: systemVerilogSource
+
+targets:
+  default:
+    filesets: [rtl]
+
+  lint:
+    filesets: [rtl]
+    flow: lint
+    flow_options:
+      tool: verilator
+      verilator_options: [-Wno-WIDTH]
+    toplevel: APLIC_AXI4Lite_wrapper
